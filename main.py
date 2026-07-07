@@ -1,519 +1,922 @@
 """
-Milk-Manager
-------------
-A simple Remote MCP server (built with FastMCP) to help manage daily milk
-purchases: track quantity bought each day, the current milk price, and
-generate monthly summaries / report data.
+Milk Manager MCP Server
+-----------------------
 
-This is intentionally kept simple:
-    - single user (no auth, no accounts)
-    - synchronous sqlite3 (no async, no ORM)
-    - one SQLite file, two tables
-    - one file: main.py
+A simple Remote MCP Server built using FastMCP for a single user
+(my mother) to manage daily milk purchases.
 
-Run it with:
-    python main.py
+Features:
+- Store daily milk quantity
+- Store milk price
+- Monthly summaries
+- Monthly report data
+- Delete month
+- Delete all entries
 
-The server will start on http://0.0.0.0:8000 using the streamable-http
-transport.
+Author: Neev Sharma
 """
 
 import sqlite3
+import tempfile
 import os
 from calendar import month_name
 
 from fastmcp import FastMCP
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
 
-DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milk_manager.db")
+TEMP_DIR = tempfile.gettempdir()
+
+DB_PATH = os.path.join(TEMP_DIR, "milk_manager.db")
+
+print(f"Database Path: {DB_PATH}")
 
 mcp = FastMCP("Milk-Manager")
 
 
-# ---------------------------------------------------------------------------
-# Database helpers
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
+# Database Initialization
+# --------------------------------------------------
 
 def get_connection():
-    """
-    Open a new connection to the SQLite database.
-
-    A fresh connection is created per operation (simple and safe for a
-    single-user, low-traffic server). `row_factory` is set so rows can be
-    accessed like dictionaries.
-    """
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    # Enforce foreign keys / basic sanity - not strictly needed here, but
-    # a good habit.
+
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys = ON")
+
     return conn
 
 
 def init_db():
-    """
-    Create the required tables if they do not already exist.
-    Called once when the server starts.
-    """
-    conn = get_connection()
+
     try:
+
+        conn = get_connection()
+
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS milk_entries (
-                date     TEXT PRIMARY KEY,
-                day      TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS milk_entries(
+
+                date TEXT PRIMARY KEY,
+
+                day TEXT NOT NULL,
+
                 quantity REAL NOT NULL
+
             )
             """
         )
+
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS settings (
-                key   TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS settings(
+
+                key TEXT PRIMARY KEY,
+
                 value TEXT NOT NULL
+
             )
             """
         )
+
+        # Check write permissions
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO settings(key,value)
+
+            VALUES('__test__','1')
+            """
+        )
+
+        conn.execute(
+            """
+            DELETE FROM settings
+
+            WHERE key='__test__'
+            """
+        )
+
         conn.commit()
+
+        print("Database initialized successfully.")
+
+    except Exception as e:
+
+        print(f"Database initialization failed: {e}")
+
+        raise
+
     finally:
+
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Small generic helpers
-# ---------------------------------------------------------------------------
+init_db()
 
-def error_response(message: str) -> dict:
-    """Standard shape for an error JSON response."""
-    return {"status": "error", "message": message}
+# --------------------------------------------------
+# Helper Functions
+# --------------------------------------------------
 
 
-def success_response(**fields) -> dict:
-    """Standard shape for a success JSON response."""
-    return {"status": "success", **fields}
+def success_response(**kwargs):
+
+    return {
+        "status": "success",
+        **kwargs
+    }
 
 
-def validate_year_month(year: int, month: int):
-    """
-    Basic sanity check for year/month values.
-    Returns an error message string if invalid, otherwise None.
-    """
-    if not isinstance(year, int) or year < 1900 or year > 2200:
-        return f"Invalid year: {year}"
-    if not isinstance(month, int) or month < 1 or month > 12:
-        return f"Invalid month: {month}. Must be between 1 and 12."
+def error_response(message):
+
+    return {
+        "status": "error",
+        "message": message
+    }
+
+
+def validate_year_month(year, month):
+
+    if year < 2000 or year > 2200:
+        return "Invalid year."
+
+    if month < 1 or month > 12:
+        return "Invalid month."
+
     return None
 
 
-def month_range_pattern(year: int, month: int) -> str:
-    """
-    Build a SQL LIKE pattern (e.g. '2026-07-%') to match all dates
-    belonging to the given year/month, since dates are stored as
-    'YYYY-MM-DD' text.
-    """
+def month_pattern(year, month):
+
     return f"{year:04d}-{month:02d}-%"
 
 
 def get_milk_price_value():
-    """
-    Internal helper: fetch the milk price as a float from the settings
-    table. Returns None if it has not been set yet.
-    """
+
     conn = get_connection()
+
     try:
+
         row = conn.execute(
-            "SELECT value FROM settings WHERE key = ?", ("milk_price",)
+            """
+            SELECT value
+
+            FROM settings
+
+            WHERE key='milk_price'
+            """
         ).fetchone()
-        return float(row["value"]) if row else None
+
+        if row is None:
+            return None
+
+        return float(row["value"])
+
     finally:
+
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Tool 1: set_milk_price
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
+# Tool 1
+# Set Milk Price
+# --------------------------------------------------
 
 @mcp.tool()
-def set_milk_price(price: float) -> dict:
-    """
-    Store (or update) the current price of one kilogram/litre of milk.
+def set_milk_price(price: float):
 
-    Args:
-        price: The new milk price. Must be a positive number.
     """
+    Save or update milk price.
+    """
+
     try:
-        if price is None or price <= 0:
-            return error_response("Price must be a positive number.")
+
+        if price <= 0:
+            return error_response(
+                "Milk price must be greater than zero."
+            )
 
         conn = get_connection()
-        try:
-            # INSERT OR REPLACE keeps a single row for the 'milk_price' key.
-            conn.execute(
-                """
-                INSERT INTO settings (key, value) VALUES ('milk_price', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (str(price),),
+
+        conn.execute(
+            """
+            INSERT INTO settings(key,value)
+
+            VALUES('milk_price',?)
+
+            ON CONFLICT(key)
+
+            DO UPDATE SET
+
+            value=excluded.value
+            """,
+            (str(price),)
+        )
+
+        conn.commit()
+
+        conn.close()
+
+        return success_response(
+            price=price
+        )
+
+    except Exception as e:
+
+        if "readonly" in str(e).lower():
+
+            return error_response(
+                "Database is read only."
             )
-            conn.commit()
-        finally:
-            conn.close()
 
-        return success_response(price=price)
-    except Exception as exc:
-        return error_response(f"Failed to set milk price: {exc}")
+        return error_response(str(e))
 
 
-# ---------------------------------------------------------------------------
-# Tool 2: get_milk_price
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
+# Tool 2
+# Get Milk Price
+# --------------------------------------------------
 
 @mcp.tool()
-def get_milk_price() -> dict:
-    """Return the currently configured milk price."""
+def get_milk_price():
+
+    """
+    Return currently configured milk price.
+    """
+
     try:
+
         price = get_milk_price_value()
+
         if price is None:
-            return error_response("Milk price has not been set yet.")
-        return success_response(price=price)
-    except Exception as exc:
-        return error_response(f"Failed to get milk price: {exc}")
 
-
-# ---------------------------------------------------------------------------
-# Tool 3: add_milk_entry
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def add_milk_entry(date: str, day: str, quantity: float) -> dict:
-    """
-    Add a new milk entry for a given date.
-
-    Args:
-        date: Date in 'YYYY-MM-DD' format, e.g. '2026-07-01'.
-        day: Day of the week, e.g. 'Wednesday'.
-        quantity: Quantity of milk purchased that day.
-    """
-    try:
-        if not date or not day:
-            return error_response("Both 'date' and 'day' are required.")
-        if quantity is None or quantity < 0:
-            return error_response("Quantity must be a non-negative number.")
-
-        conn = get_connection()
-        try:
-            existing = conn.execute(
-                "SELECT date FROM milk_entries WHERE date = ?", (date,)
-            ).fetchone()
-            if existing:
-                return error_response(
-                    f"An entry for {date} already exists. Use edit_milk_entry to modify it."
-                )
-
-            conn.execute(
-                "INSERT INTO milk_entries (date, day, quantity) VALUES (?, ?, ?)",
-                (date, day, quantity),
+            return error_response(
+                "Milk price has not been set yet."
             )
-            conn.commit()
-        finally:
-            conn.close()
 
-        return success_response(date=date, day=day, quantity=quantity)
-    except Exception as exc:
-        return error_response(f"Failed to add milk entry: {exc}")
+        return success_response(
+
+            milk_price=price
+
+        )
+
+    except Exception as e:
+
+        return error_response(str(e))
 
 
-# ---------------------------------------------------------------------------
-# Tool 4: edit_milk_entry
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
+# Tool 3
+# Add Milk Entry
+# --------------------------------------------------
 
 @mcp.tool()
-def edit_milk_entry(date: str, quantity: float = None, day: str = None) -> dict:
-    """
-    Edit an existing milk entry. Only the fields provided are updated.
+def add_milk_entry(
+    date: str,
+    day: str,
+    quantity: float
+):
 
-    Args:
-        date: Date of the entry to edit ('YYYY-MM-DD').
-        quantity: New quantity (optional).
-        day: New day name (optional).
     """
+    Add a milk entry.
+
+    Example:
+
+    date="2026-07-07"
+
+    day="Tuesday"
+
+    quantity=2
+    """
+
     try:
-        if not date:
-            return error_response("'date' is required.")
-        if quantity is None and day is None:
-            return error_response("Provide at least one of 'quantity' or 'day' to update.")
-        if quantity is not None and quantity < 0:
-            return error_response("Quantity must be a non-negative number.")
 
-        conn = get_connection()
-        try:
-            existing = conn.execute(
-                "SELECT * FROM milk_entries WHERE date = ?", (date,)
-            ).fetchone()
-            if not existing:
-                return error_response(f"No entry found for {date}.")
-
-            new_quantity = quantity if quantity is not None else existing["quantity"]
-            new_day = day if day is not None else existing["day"]
-
-            conn.execute(
-                "UPDATE milk_entries SET quantity = ?, day = ? WHERE date = ?",
-                (new_quantity, new_day, date),
+        if quantity < 0:
+            return error_response(
+                "Quantity cannot be negative."
             )
-            conn.commit()
-        finally:
-            conn.close()
-
-        return success_response(date=date, day=new_day, quantity=new_quantity)
-    except Exception as exc:
-        return error_response(f"Failed to edit milk entry: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Tool 5: list_month_entries
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def list_month_entries(year: int, month: int) -> dict:
-    """
-    List every milk entry for the given month, ordered by date.
-
-    Args:
-        year: e.g. 2026
-        month: 1-12
-    """
-    try:
-        validation_error = validate_year_month(year, month)
-        if validation_error:
-            return error_response(validation_error)
 
         conn = get_connection()
-        try:
-            rows = conn.execute(
-                "SELECT date, day, quantity FROM milk_entries WHERE date LIKE ? ORDER BY date ASC",
-                (month_range_pattern(year, month),),
-            ).fetchall()
-        finally:
+
+        existing = conn.execute(
+            """
+            SELECT date
+
+            FROM milk_entries
+
+            WHERE date=?
+            """,
+            (date,)
+        ).fetchone()
+
+        if existing:
+
             conn.close()
 
-        entries = [dict(row) for row in rows]
-        return success_response(year=year, month=month, entries=entries, count=len(entries))
-    except Exception as exc:
-        return error_response(f"Failed to list month entries: {exc}")
+            return error_response(
+                f"Entry already exists for {date}. Use edit_milk_entry."
+            )
+
+        conn.execute(
+            """
+            INSERT INTO milk_entries(
+
+                date,
+
+                day,
+
+                quantity
+
+            )
+
+            VALUES(?,?,?)
+            """,
+            (
+                date,
+                day,
+                quantity
+            )
+        )
+
+        conn.commit()
+
+        conn.close()
+
+        return success_response(
+
+            date=date,
+
+            day=day,
+
+            quantity=quantity
+
+        )
+
+    except Exception as e:
+
+        if "readonly" in str(e).lower():
+
+            return error_response(
+                "Database is read only."
+            )
+
+        return error_response(str(e))
 
 
-# ---------------------------------------------------------------------------
-# Tool 6: monthly_summary
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
+# Tool 4
+# Edit Milk Entry
+# --------------------------------------------------
 
 @mcp.tool()
-def monthly_summary(year: int, month: int) -> dict:
-    """
-    Return a summary of milk purchases for the given month:
-    total days with entries, total quantity, average quantity per day,
-    and total amount (based on the currently configured milk price).
+def edit_milk_entry(
 
-    Args:
-        year: e.g. 2026
-        month: 1-12
+    date: str,
+
+    quantity: float = None,
+
+    day: str = None
+
+):
+
     """
+    Edit an existing milk entry.
+    """
+
     try:
-        validation_error = validate_year_month(year, month)
-        if validation_error:
-            return error_response(validation_error)
+
+        conn = get_connection()
+
+        row = conn.execute(
+            """
+            SELECT *
+
+            FROM milk_entries
+
+            WHERE date=?
+            """,
+            (date,)
+        ).fetchone()
+
+        if row is None:
+
+            conn.close()
+
+            return error_response(
+                "Entry not found."
+            )
+
+        new_quantity = quantity
+
+        if quantity is None:
+            new_quantity = row["quantity"]
+
+        new_day = day
+
+        if day is None:
+            new_day = row["day"]
+
+        conn.execute(
+            """
+            UPDATE milk_entries
+
+            SET
+
+            quantity=?,
+
+            day=?
+
+            WHERE date=?
+            """,
+            (
+                new_quantity,
+                new_day,
+                date
+            )
+        )
+
+        conn.commit()
+
+        conn.close()
+
+        return success_response(
+
+            date=date,
+
+            quantity=new_quantity,
+
+            day=new_day
+
+        )
+
+    except Exception as e:
+
+        if "readonly" in str(e).lower():
+
+            return error_response(
+                "Database is read only."
+            )
+
+        return error_response(str(e))
+
+
+# --------------------------------------------------
+# Tool 5
+# List Month Entries
+# --------------------------------------------------
+
+@mcp.tool()
+def list_month_entries(
+
+    year: int,
+
+    month: int
+
+):
+
+    """
+    Return every milk entry for a month.
+    """
+
+    try:
+
+        error = validate_year_month(
+            year,
+            month
+        )
+
+        if error:
+            return error_response(error)
+
+        conn = get_connection()
+
+        rows = conn.execute(
+            """
+            SELECT
+
+                date,
+
+                day,
+
+                quantity
+
+            FROM milk_entries
+
+            WHERE date LIKE ?
+
+            ORDER BY date ASC
+            """,
+            (
+                month_pattern(
+                    year,
+                    month
+                ),
+            )
+        ).fetchall()
+
+        conn.close()
+
+        entries = []
+
+        for row in rows:
+
+            entries.append(
+
+                {
+
+                    "date": row["date"],
+
+                    "day": row["day"],
+
+                    "quantity": row["quantity"]
+
+                }
+
+            )
+
+        return success_response(
+
+            month=month,
+
+            year=year,
+
+            total_entries=len(entries),
+
+            entries=entries
+
+        )
+
+    except Exception as e:
+
+        return error_response(str(e))
+    
+# --------------------------------------------------
+# Tool 6
+# Monthly Summary
+# --------------------------------------------------
+
+@mcp.tool()
+def monthly_summary(year: int, month: int):
+
+    try:
+
+        error = validate_year_month(year, month)
+
+        if error:
+            return error_response(error)
 
         milk_price = get_milk_price_value()
+
         if milk_price is None:
-            return error_response("Milk price has not been set yet. Use set_milk_price first.")
+            return error_response(
+                "Milk price has not been set."
+            )
 
         conn = get_connection()
-        try:
-            rows = conn.execute(
-                "SELECT quantity FROM milk_entries WHERE date LIKE ?",
-                (month_range_pattern(year, month),),
-            ).fetchall()
-        finally:
-            conn.close()
 
-        total_days_with_entries = len(rows)
-        total_quantity = sum(row["quantity"] for row in rows)
-        average_quantity_per_day = (
-            total_quantity / total_days_with_entries if total_days_with_entries > 0 else 0
+        rows = conn.execute(
+            """
+            SELECT quantity
+
+            FROM milk_entries
+
+            WHERE date LIKE ?
+            """,
+            (month_pattern(year, month),)
+        ).fetchall()
+
+        conn.close()
+
+        total_days = len(rows)
+
+        total_quantity = sum(
+            row["quantity"] for row in rows
         )
+
+        average_quantity = (
+            total_quantity / total_days
+            if total_days
+            else 0
+        )
+
         total_amount = total_quantity * milk_price
 
         return success_response(
-            year=year,
+
             month=month,
+
+            year=year,
+
             milk_price=milk_price,
-            total_days_with_entries=total_days_with_entries,
-            total_quantity=round(total_quantity, 3),
-            average_quantity_per_day=round(average_quantity_per_day, 3),
-            total_amount=round(total_amount, 2),
+
+            total_days_with_entries=total_days,
+
+            total_quantity=round(total_quantity, 2),
+
+            average_quantity_per_day=round(
+                average_quantity,
+                2
+            ),
+
+            total_amount=round(total_amount, 2)
+
         )
-    except Exception as exc:
-        return error_response(f"Failed to compute monthly summary: {exc}")
+
+    except Exception as e:
+
+        return error_response(str(e))
 
 
-# ---------------------------------------------------------------------------
-# Tool 7: generate_monthly_report_data
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
+# Tool 7
+# Generate Monthly Report Data
+# --------------------------------------------------
 
 @mcp.tool()
-def generate_monthly_report_data(year: int, month: int) -> dict:
-    """
-    Return all the data needed to build a monthly milk report (e.g. a PDF
-    to share with the milkman). This tool does NOT create a PDF itself -
-    it just returns structured JSON data for that purpose.
+def generate_monthly_report_data(
+    year: int,
+    month: int
+):
 
-    Args:
-        year: e.g. 2026
-        month: 1-12
-    """
     try:
-        validation_error = validate_year_month(year, month)
-        if validation_error:
-            return error_response(validation_error)
+
+        error = validate_year_month(
+            year,
+            month
+        )
+
+        if error:
+            return error_response(error)
 
         milk_price = get_milk_price_value()
+
         if milk_price is None:
-            return error_response("Milk price has not been set yet. Use set_milk_price first.")
+            return error_response(
+                "Milk price has not been set."
+            )
 
         conn = get_connection()
-        try:
-            rows = conn.execute(
-                "SELECT date, day, quantity FROM milk_entries WHERE date LIKE ? ORDER BY date ASC",
-                (month_range_pattern(year, month),),
-            ).fetchall()
-        finally:
-            conn.close()
+
+        rows = conn.execute(
+            """
+            SELECT
+
+            date,
+
+            day,
+
+            quantity
+
+            FROM milk_entries
+
+            WHERE date LIKE ?
+
+            ORDER BY date ASC
+            """,
+            (
+                month_pattern(
+                    year,
+                    month
+                ),
+            )
+        ).fetchall()
+
+        conn.close()
 
         entries = []
-        total_quantity = 0.0
+
+        total_quantity = 0
+
         for row in rows:
-            amount = round(row["quantity"] * milk_price, 2)
-            total_quantity += row["quantity"]
-            entries.append(
-                {
-                    "date": row["date"],
-                    "day": row["day"],
-                    "quantity": row["quantity"],
-                    "amount": amount,
-                }
+
+            amount = round(
+                row["quantity"] * milk_price,
+                2
             )
 
-        total_amount = round(total_quantity * milk_price, 2)
-        average_quantity = round(total_quantity / len(entries), 3) if entries else 0
+            total_quantity += row["quantity"]
+
+            entries.append(
+
+                {
+
+                    "date": row["date"],
+
+                    "day": row["day"],
+
+                    "quantity": row["quantity"],
+
+                    "amount": amount
+
+                }
+
+            )
+
+        total_amount = round(
+            total_quantity * milk_price,
+            2
+        )
+
+        average_quantity = (
+
+            round(
+                total_quantity / len(entries),
+                2
+            )
+
+            if entries
+
+            else 0
+
+        )
 
         return {
+
             "status": "success",
+
             "month": month_name[month],
+
             "year": year,
+
             "milk_price": milk_price,
+
             "entries": entries,
+
             "summary": {
-                "total_quantity": round(total_quantity, 3),
+
+                "total_quantity": round(
+                    total_quantity,
+                    2
+                ),
+
                 "average_quantity": average_quantity,
-                "total_amount": total_amount,
-            },
+
+                "total_amount": total_amount
+
+            }
+
         }
-    except Exception as exc:
-        return error_response(f"Failed to generate monthly report data: {exc}")
+
+    except Exception as e:
+
+        return error_response(str(e))
 
 
-# ---------------------------------------------------------------------------
-# Tool 8: delete_month_entries (developer tool)
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
+# Tool 8
+# Delete Month Entries
+# --------------------------------------------------
 
 @mcp.tool()
-def delete_month_entries(year: int, month: int) -> dict:
-    """
-    Developer tool: delete all milk entries belonging to the given month.
+def delete_month_entries(
+    year: int,
+    month: int
+):
 
-    Args:
-        year: e.g. 2026
-        month: 1-12
-    """
     try:
-        validation_error = validate_year_month(year, month)
-        if validation_error:
-            return error_response(validation_error)
+
+        error = validate_year_month(
+            year,
+            month
+        )
+
+        if error:
+            return error_response(error)
 
         conn = get_connection()
-        try:
-            cursor = conn.execute(
-                "DELETE FROM milk_entries WHERE date LIKE ?",
-                (month_range_pattern(year, month),),
+
+        cur = conn.execute(
+            """
+            DELETE
+
+            FROM milk_entries
+
+            WHERE date LIKE ?
+            """,
+            (
+                month_pattern(
+                    year,
+                    month
+                ),
             )
-            conn.commit()
-            deleted_count = cursor.rowcount
-        finally:
-            conn.close()
+        )
 
-        return success_response(year=year, month=month, deleted_count=deleted_count)
-    except Exception as exc:
-        return error_response(f"Failed to delete month entries: {exc}")
+        conn.commit()
 
+        deleted = cur.rowcount
 
-# ---------------------------------------------------------------------------
-# Tool 9: delete_all_entries (developer tool)
-# ---------------------------------------------------------------------------
+        conn.close()
 
-@mcp.tool()
-def delete_all_entries() -> dict:
-    """
-    Developer tool: delete every milk entry from the database.
-    The milk price setting is left untouched.
-    """
-    try:
-        conn = get_connection()
-        try:
-            cursor = conn.execute("DELETE FROM milk_entries")
-            conn.commit()
-            deleted_count = cursor.rowcount
-        finally:
-            conn.close()
+        return success_response(
 
-        return success_response(deleted_count=deleted_count)
-    except Exception as exc:
-        return error_response(f"Failed to delete all entries: {exc}")
+            deleted_entries=deleted,
+
+            month=month,
+
+            year=year
+
+        )
+
+    except Exception as e:
+
+        return error_response(str(e))
 
 
-# ---------------------------------------------------------------------------
-# Tool 10: reset_milk_price (developer tool)
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
+# Tool 9
+# Delete All Entries
+# --------------------------------------------------
 
 @mcp.tool()
-def reset_milk_price() -> dict:
-    """
-    Developer tool: reset the milk price back to 0, so a new price can be
-    set from scratch using set_milk_price.
-    """
+def delete_all_entries():
+
     try:
+
         conn = get_connection()
-        try:
-            conn.execute(
-                """
-                INSERT INTO settings (key, value) VALUES ('milk_price', '0')
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
 
-        return success_response(price=0)
-    except Exception as exc:
-        return error_response(f"Failed to reset milk price: {exc}")
+        cur = conn.execute(
+
+            "DELETE FROM milk_entries"
+
+        )
+
+        conn.commit()
+
+        deleted = cur.rowcount
+
+        conn.close()
+
+        return success_response(
+
+            deleted_entries=deleted
+
+        )
+
+    except Exception as e:
+
+        return error_response(str(e))
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# --------------------------------------------------
+# Tool 10
+# Reset Milk Price
+# --------------------------------------------------
+
+@mcp.tool()
+def reset_milk_price():
+
+    try:
+
+        conn = get_connection()
+
+        conn.execute(
+
+            """
+            INSERT INTO settings(key,value)
+
+            VALUES('milk_price','0')
+
+            ON CONFLICT(key)
+
+            DO UPDATE SET
+
+            value='0'
+            """
+
+        )
+
+        conn.commit()
+
+        conn.close()
+
+        return success_response(
+
+            milk_price=0
+
+        )
+
+    except Exception as e:
+
+        return error_response(str(e))
+
+
+# --------------------------------------------------
+# Start Server
+# --------------------------------------------------
 
 if __name__ == "__main__":
+
     init_db()
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
+
+    mcp.run(
+
+        transport="streamable-http",
+
+        host="0.0.0.0",
+
+        port=8000
+
+    )
